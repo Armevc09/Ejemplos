@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+
+import argparse
+import sys
+import time
+
+import cv2
+import numpy as np
+
+try:
+    import serial
+except Exception:
+    serial = None
+
+try:
+    import RPi.GPIO as GPIO
+    HAS_GPIO = True
+except Exception:
+    HAS_GPIO = False
+
+
+def send_uart(port, baud, message):
+    if serial is None:
+        print('[UART] pyserial no instalado; no se envía. Mensaje:', message.strip())
+        return
+    try:
+        with serial.Serial(port, baud, timeout=1) as ser:
+            ser.write(message.encode('utf-8'))
+            print(f"[UART] Enviado: {message.strip()} -> {port} @ {baud}")
+    except Exception as e:
+        print('[UART] Error al abrir/enviar por puerto serial:', e)
+
+
+def count_color_objects(frame, color, min_area=300):
+    """Detectar y contar objetos de un color en el frame.
+
+    color: 'blue', 'red', 'black'
+    devuelve lista de contornos y count
+    """
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    if color == 'blue':
+        lower = np.array([90, 80, 40])
+        upper = np.array([140, 255, 255])
+        mask = cv2.inRange(hsv, lower, upper)
+    elif color == 'red':
+        lower1 = np.array([0, 70, 50])
+        upper1 = np.array([10, 255, 255])
+        lower2 = np.array([170, 70, 50])
+        upper2 = np.array([180, 255, 255])
+        mask = cv2.inRange(hsv, lower1, upper1) | cv2.inRange(hsv, lower2, upper2)
+    elif color == 'black':
+        # low V (dark) and low S
+        lower = np.array([0, 0, 0])
+        upper = np.array([180, 255, 50])
+        mask = cv2.inRange(hsv, lower, upper)
+    else:
+        return [], 0
+
+    # Clean up mask
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    good = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area >= min_area:
+            good.append(c)
+    return good, len(good)
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument('--serial', '-s', default='/dev/ttyACM0', help='Puerto serie del TIVA')
+    p.add_argument('--baud', type=int, default=9600, help='Baud rate UART')
+    p.add_argument('--device', '-d', type=int, default=0, help='Índice de la cámara')
+    p.add_argument('--min-area', type=int, default=300, help='Área mínima de contorno para contar')
+    args = p.parse_args()
+
+    if serial is None:
+        print('Aviso: pyserial no está instalado. Instala con: pip install pyserial')
+
+    # Opcional: init GPIO si está disponible (no usado por defecto)
+    if HAS_GPIO:
+        GPIO.setmode(GPIO.BCM)
+        # Aquí puedes definir pines de botones si quieres
+
+    cap = cv2.VideoCapture(args.device)
+    if not cap.isOpened():
+        print('No se pudo abrir la cámara', args.device)
+        sys.exit(1)
+
+    print("Cámara abierta. Pulsa 's' para sacar foto, 'q' para salir.")
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print('Error leyendo cámara')
+            break
+
+        disp = frame.copy()
+        cv2.putText(disp, "s: foto, q: salir", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+        cv2.imshow('Live', disp)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        if key == ord('s'):
+            # Take snapshot and process
+            snap = frame.copy()
+            print('Procesando imagen...')
+            blue_contours, blue_count = count_color_objects(snap, 'blue', min_area=args.min_area)
+            red_contours, red_count = count_color_objects(snap, 'red', min_area=args.min_area)
+            black_contours, black_count = count_color_objects(snap, 'black', min_area=args.min_area)
+
+            print(f'Recuento - azul: {blue_count}, rojo: {red_count}, negro: {black_count}')
+
+            # Decide majority and if >=2 send message
+            messages = []
+            if blue_count >= 2 and blue_count > red_count and blue_count > black_count:
+                messages.append(f'marcador_azul {blue_count}\n')
+            elif red_count >= 2 and red_count > blue_count and red_count > black_count:
+                messages.append(f'marcador_rojo {red_count}\n')
+            elif black_count >= 2 and black_count > blue_count and black_count > red_count:
+                messages.append(f'marcador_negro {black_count}\n')
+            else:
+                print('No hay 2 o más marcadores claros de un mismo color. No se envía mensaje.')
+
+            for m in messages:
+                send_uart(args.serial, args.baud, m)
+
+    cap.release()
+    cv2.destroyAllWindows()
+    if HAS_GPIO:
+        GPIO.cleanup()
+
+
+if __name__ == '__main__':
+    main()
