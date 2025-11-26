@@ -1,0 +1,30 @@
+# --- Enviar CORREO con Gmail usando Python ---
+
+import smtplib
+from datetime import datetime
+
+# Crear sesión SMTP
+s = smtplib.SMTP('smtp.gmail.com', 587)
+s.starttls()
+
+# Iniciar sesión
+s.login("kevin.calani@ucb.edu.bo", "cauq ykxh uqff llhk")
+
+# Obtener fecha y hora actual
+current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+# Mensaje del correo
+message = f"""\
+Subject: Alerta del Sistema
+
+El sistema se detuvo en la fecha y hora: {current_time}
+Mensaje personalizado: El sistema ha dejado de funcionar inesperadamente. Por favor, revisa el estado.
+"""
+
+# Enviar correo
+s.sendmail("kevin.calani@ucb.edu.bo", "kevin.calani@ucb.edu.bo", message)
+
+print("Correo enviado correctamente.")
+
+# Cerrar sesión SMTP
+s.quit()
