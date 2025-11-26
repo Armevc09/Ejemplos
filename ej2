@@ -1,0 +1,318 @@
+import argparse
+import os
+import sys
+import tempfile
+import zipfile
+import time
+
+try:
+    import numpy as np
+    import cv2
+except Exception as e:
+    print("Error: falta una dependencia local (cv2/numpy).")
+    raise
+
+try:
+    import tensorflow as tf
+    from tensorflow.keras.models import load_model
+except Exception as e:
+        sys.exit(1)
+
+try:
+    import serial
+except Exception as e:
+    print("Error: falta librería serial (pip install pyserial)")
+    sys.exit(1)
+
+
+def prepare_model_path(path):
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Modelo no encontrado: {path}")
+
+    if zipfile.is_zipfile(path):
+        tmp = tempfile.mkdtemp(prefix="model_unzip_")
+        with zipfile.ZipFile(path, 'r') as z:
+            z.extractall(tmp)
+        # Buscar un archivo .keras
+        for root, dirs, files in os.walk(tmp):
+            for f in files:
+                if f.endswith('.keras'):
+                    return os.path.join(root, f)
+            if 'saved_model.pb' in files:
+                return root
+
+        return tmp
+    else:
+        return path
+
+
+def has_display():
+    if os.name == 'nt':
+        return True
+    return bool(os.environ.get('DISPLAY'))
+
+
+# Clase para detectar y registrar objetos durante un tiempo determinado
+class RegistroDeteccionObjetos:
+    """
+    Clase que mantiene un registro de objetos detectados durante un tiempo específico.
+    Cuenta cuántas veces se detecta cada objeto y puede enviar por UART el objeto más detectado.
+    """
+    
+    def __init__(self, puerto_serial=None):
+        """
+        Inicializa el registro de detecciones
+        
+        Args:
+            puerto_serial: Objeto serial.Serial para enviar datos por UART
+        """
+        # Diccionario para almacenar el conteo de cada objeto detectado
+        self.registro_objetos = {}
+        
+        # Puerto serial para comunicación UART
+        self.puerto_serial = puerto_serial
+        
+        # Tiempo en segundos para realizar el registro
+        self.tiempo_registro = 0
+        
+        # Tiempo de inicio del registro
+        self.tiempo_inicio = None
+        
+        # Bandera para indicar si el registro está activo
+        self.registro_activo = False
+    
+    def iniciar_registro(self, duracion_segundos):
+        """
+        Inicia un nuevo período de registro de objetos
+        
+        Args:
+            duracion_segundos: Tiempo en segundos para detectar objetos
+        """
+        self.tiempo_registro = duracion_segundos
+        self.tiempo_inicio = time.time()
+        self.registro_activo = True
+        self.registro_objetos = {}  # Limpiar registro anterior
+        print(f"\n=== Iniciando registro de objetos por {duracion_segundos} segundos ===")
+    
+    def registrar_deteccion(self, nombre_objeto):
+        """
+        Registra la detección de un objeto
+        
+        Args:
+            nombre_objeto: Nombre del objeto detectado
+        
+        Returns:
+            bool: True si el registro sigue activo, False si ya finalizó
+        """
+        # Verificar si el tiempo de registro ha finalizado
+        if not self.registro_activo:
+            return False
+        
+        tiempo_transcurrido = time.time() - self.tiempo_inicio
+        
+        if tiempo_transcurrido >= self.tiempo_registro:
+            self.registro_activo = False
+            self.finalizar_registro()
+            return False
+        
+        # Incrementar contador del objeto detectado
+        if nombre_objeto in self.registro_objetos:
+            self.registro_objetos[nombre_objeto] += 1
+        else:
+            self.registro_objetos[nombre_objeto] = 1
+        
+        # Mostrar progreso
+        tiempo_restante = int(self.tiempo_registro - tiempo_transcurrido)
+        print(f"[{nombre_objeto}] detectado: {self.registro_objetos[nombre_objeto]} veces | Tiempo restante: {tiempo_restante}s")
+        
+        return True
+    
+    def obtener_objeto_mas_detectado(self):
+        """
+        Encuentra el objeto que fue detectado más veces
+        
+        Returns:
+            tuple: (nombre_objeto, cantidad_detecciones) o None si no hay objetos
+        """
+        if not self.registro_objetos:
+            return None
+        
+        # Encontrar el objeto con el máximo número de detecciones
+        objeto_ganador = max(self.registro_objetos.items(), key=lambda x: x[1])
+        return objeto_ganador
+    
+    def mostrar_resumen_registro(self):
+        """
+        Muestra un resumen completo de todos los objetos detectados
+        """
+        print("\n" + "="*50)
+        print("RESUMEN DE DETECCIONES")
+        print("="*50)
+        
+        if not self.registro_objetos:
+            print("No se detectaron objetos durante el período de registro")
+            return
+        
+        # Ordenar objetos por cantidad de detecciones (de mayor a menor)
+        objetos_ordenados = sorted(self.registro_objetos.items(), 
+                                   key=lambda x: x[1], 
+                                   reverse=True)
+        
+        print(f"\nTotal de objetos diferentes detectados: {len(objetos_ordenados)}")
+        print("\nDetalle de detecciones:")
+        print("-" * 50)
+        
+        for posicion, (nombre_objeto, cantidad) in enumerate(objetos_ordenados, 1):
+            print(f"{posicion}. {nombre_objeto}: {cantidad} detecciones")
+        
+        print("="*50)
+    
+    def enviar_objeto_ganador_uart(self):
+        """
+        Envía por UART el objeto que fue detectado más veces.
+        En lugar de encender un LED, envía el nombre del objeto ganador.
+        """
+        objeto_ganador = self.obtener_objeto_mas_detectado()
+        
+        if objeto_ganador is None:
+            print("\n⚠ No hay objetos para enviar por UART (registro vacío)")
+            return
+        
+        nombre_objeto, cantidad_detecciones = objeto_ganador
+        
+        # Formato del mensaje UART: "OBJ <nombre> <cantidad>"
+        mensaje = f"OBJ {nombre_objeto} {cantidad_detecciones}\n"
+        
+        # Si hay puerto serial configurado, enviar el mensaje
+        if self.puerto_serial and self.puerto_serial.is_open:
+            try:
+                self.puerto_serial.write(mensaje.encode())
+                print(f"\n✓ ENVIADO POR UART: {mensaje.strip()}")
+                print(f"  → Objeto ganador: '{nombre_objeto}' con {cantidad_detecciones} detecciones")
+            except Exception as error:
+                print(f"\n✗ Error al enviar por UART: {error}")
+        else:
+            print(f"\n⚠ Puerto UART no disponible. Mensaje que se enviaría: {mensaje.strip()}")
+    
+    def finalizar_registro(self):
+        """
+        Finaliza el período de registro y muestra resultados
+        """
+        self.registro_activo = False
+        print("\n\n🏁 ¡Tiempo de registro finalizado!")
+        
+        # Mostrar resumen completo
+        self.mostrar_resumen_registro()
+        
+        # Enviar objeto ganador por UART
+        self.enviar_objeto_ganador_uart()
+
+
+def main():
+    p = argparse.ArgumentParser(description='Ejecutar modelo Keras en vivo desde la cámara con registro de detecciones.')
+    p.add_argument('-m', '--model', default='modelov2.keras.zip', help='Ruta al modelo (.keras, carpeta SavedModel, o .zip)')
+    p.add_argument('-d', '--device', type=int, default=0, help='Índice del dispositivo de cámara (por defecto 0)')
+    p.add_argument('--headless', action='store_true', help='No mostrar ventana (útil en servidores)')
+    p.add_argument('--image-size', type=int, nargs=2, default=(200, 200), help='Tamaño (w h) para redimensionar la imagen')
+    p.add_argument('--uart-port', default='/dev/ttyACM0', help='Puerto serial UART (por defecto /dev/ttyACM0)')
+    p.add_argument('--uart-baudrate', type=int, default=9600, help='Baudrate UART (por defecto 9600)')
+    p.add_argument('--tiempo-registro', type=int, default=30, help='Tiempo en segundos para registrar detecciones (por defecto 30)')
+    args = p.parse_args()
+
+    try:
+        model_path = prepare_model_path(args.model)
+        model = load_model(model_path)
+        print(f"Modelo cargado desde: {model_path}")
+    except Exception as e:
+        print(f"Error cargando modelo: {e}")
+        sys.exit(2)
+
+    CLASS_NAMES = ['borrador', 'mRojo', 'mNegro', 'mAzul', 'nada']
+    IMAGE_SIZE = tuple(args.image_size)
+
+    cap = cv2.VideoCapture(args.device)
+    if not cap.isOpened():
+        print(f"No se pudo abrir la cámara {args.device}. Prueba con otro índice (0,1,2...).")
+        sys.exit(3)
+
+    print("Cámara abierta. Presiona 'q' en la ventana para salir.")
+
+    display = has_display() and not args.headless
+    if not display:
+        print("Modo headless: no se mostrará la ventana. Usa --headless para forzar este comportamiento.")
+
+    # Configurar puerto UART para envío de datos
+    puerto_uart = None
+    try:
+        puerto_uart = serial.Serial(args.uart_port, args.uart_baudrate, timeout=1)
+        puerto_uart.reset_input_buffer()
+        print(f"✓ Puerto UART abierto: {args.uart_port} @ {args.uart_baudrate} baudios")
+    except Exception as error:
+        print(f"⚠ No se pudo abrir puerto UART ({args.uart_port}): {error}")
+        print("  Continuando sin comunicación UART...")
+    
+    # Crear instancia del registro de objetos
+    registro = RegistroDeteccionObjetos(puerto_uart)
+    
+    # Iniciar el registro por el tiempo especificado
+    registro.iniciar_registro(args.tiempo_registro)
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("No se pudo leer frame. Saliendo...")
+            break
+
+        # Preprocesar imagen para el modelo
+        img = cv2.resize(frame, IMAGE_SIZE, interpolation=cv2.INTER_AREA)
+        img = np.expand_dims(img, axis=0)
+        img = tf.cast(img, tf.float32) / 255.0
+
+        # Realizar predicción
+        preds = model.predict(img, verbose=0)
+        idx = int(np.argmax(preds[0]))
+        label = CLASS_NAMES[idx] if idx < len(CLASS_NAMES) else f"Clase {idx}"
+        conf = float(np.max(preds[0])) * 100.0
+
+        # Solo registrar detecciones con confianza razonable (> 60%) y que no sean "nada"
+        if conf > 60.0 and label != 'nada':
+            # Registrar la detección del objeto
+            registro_continua = registro.registrar_deteccion(label)
+            
+            # Si el registro ha finalizado, salir del bucle
+            if not registro_continua:
+                break
+
+        text = f'{label} ({conf:.2f}%)'
+        cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        
+        # Mostrar información del registro en el frame
+        if registro.registro_activo:
+            tiempo_transcurrido = time.time() - registro.tiempo_inicio
+            tiempo_restante = int(registro.tiempo_registro - tiempo_transcurrido)
+            info_registro = f'Tiempo restante: {tiempo_restante}s'
+            cv2.putText(frame, info_registro, (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
+        if display:
+            cv2.imshow('Live Prediction', frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+        else:
+            print(text)
+            time.sleep(0.1)
+
+    # Limpiar recursos
+    cap.release()
+    if display:
+        cv2.destroyAllWindows()
+    
+    if puerto_uart and puerto_uart.is_open:
+        puerto_uart.close()
+        print("\n✓ Puerto UART cerrado")
+
+
+if __name__ == '__main__':
+    main()
+
+
