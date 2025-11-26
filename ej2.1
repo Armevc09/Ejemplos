@@ -1,0 +1,237 @@
+import argparse
+import os
+import sys
+import tempfile
+import zipfile
+import time
+
+try:
+    import numpy as np
+    import cv2
+except Exception as e:
+    print("Error: falta una dependencia local (cv2/numpy).")
+    raise
+
+try:
+    import tensorflow as tf
+    from tensorflow.keras.models import load_model
+except Exception as e:
+        sys.exit(1)
+
+try:
+    import serial
+except Exception as e:
+    print("Error: falta librería serial (pip install pyserial)")
+    sys.exit(1)
+
+
+def prepare_model_path(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Modelo no encontrado: {path}")
+
+    if zipfile.is_zipfile(path):
+        tmp = tempfile.mkdtemp(prefix="model_unzip_")
+        with zipfile.ZipFile(path, 'r') as z:
+            z.extractall(tmp)
+        for root, dirs, files in os.walk(tmp):
+            for f in files:
+                if f.endswith('.keras'):
+                    return os.path.join(root, f)
+            if 'saved_model.pb' in files:
+                return root
+        return tmp
+    else:
+        return path
+
+
+def has_display():
+    if os.name == 'nt':
+        return True
+    return bool(os.environ.get('DISPLAY'))
+
+
+class RegistroDeteccionObjetos:
+    
+    def __init__(self, puerto_serial=None):
+        self.registro_objetos = {}
+        self.puerto_serial = puerto_serial
+        self.tiempo_registro = 0
+        self.tiempo_inicio = None
+        self.registro_activo = False
+    
+    def iniciar_registro(self, duracion_segundos):
+        self.tiempo_registro = duracion_segundos
+        self.tiempo_inicio = time.time()
+        self.registro_activo = True
+        self.registro_objetos = {}
+        print(f"\niniciando registro de objetos por {duracion_segundos} segundos")
+    
+    def registrar_deteccion(self, nombre_objeto):
+        if not self.registro_activo:
+            return False
+        
+        tiempo_transcurrido = time.time() - self.tiempo_inicio
+        
+        if tiempo_transcurrido >= self.tiempo_registro:
+            self.registro_activo = False
+            self.finalizar_registro()
+            return False
+        
+        if nombre_objeto in self.registro_objetos:
+            self.registro_objetos[nombre_objeto] += 1
+        else:
+            self.registro_objetos[nombre_objeto] = 1
+        
+        tiempo_restante = int(self.tiempo_registro - tiempo_transcurrido)
+        print(f"[{nombre_objeto}] detectado: {self.registro_objetos[nombre_objeto]} veces | tiempo restante: {tiempo_restante}s")
+        
+        return True
+    
+    def obtener_objeto_mas_detectado(self):
+        if not self.registro_objetos:
+            return None
+        objeto_ganador = max(self.registro_objetos.items(), key=lambda x: x[1])
+        return objeto_ganador
+    
+    def mostrar_resumen_registro(self):
+        print("\n" + "="*50)
+        print("resumen de detecciones")
+        print("="*50)
+        
+        if not self.registro_objetos:
+            print("no se detectaron objetos")
+            return
+        
+        objetos_ordenados = sorted(self.registro_objetos.items(), key=lambda x: x[1], reverse=True)
+        
+        print(f"\ntotal de objetos diferentes: {len(objetos_ordenados)}")
+        print("\ndetalle:")
+        print("-" * 50)
+        
+        for posicion, (nombre_objeto, cantidad) in enumerate(objetos_ordenados, 1):
+            print(f"{posicion}. {nombre_objeto}: {cantidad} detecciones")
+        
+        print("="*50)
+    
+    def enviar_objeto_ganador_uart(self):
+        objeto_ganador = self.obtener_objeto_mas_detectado()
+        
+        if objeto_ganador is None:
+            print("\nno hay objetos para enviar")
+            return
+        
+        nombre_objeto, cantidad_detecciones = objeto_ganador
+        mensaje = f"OBJ {nombre_objeto} {cantidad_detecciones}\n"
+        
+        if self.puerto_serial and self.puerto_serial.is_open:
+            try:
+                self.puerto_serial.write(mensaje.encode())
+                print(f"\nenviado por uart: {mensaje.strip()}")
+                print(f"objeto ganador: '{nombre_objeto}' con {cantidad_detecciones} detecciones")
+            except Exception as error:
+                print(f"\nerror al enviar por uart: {error}")
+        else:
+            print(f"\npuerto uart no disponible. mensaje: {mensaje.strip()}")
+    
+    def finalizar_registro(self):
+        self.registro_activo = False
+        print("\n\ntiempo de registro finalizado")
+        self.mostrar_resumen_registro()
+        self.enviar_objeto_ganador_uart()
+
+
+def main():
+    p = argparse.ArgumentParser(description='ejecutar modelo keras en vivo desde camara')
+    p.add_argument('-m', '--model', default='modelov2.keras.zip', help='ruta al modelo')
+    p.add_argument('-d', '--device', type=int, default=0, help='indice de camara')
+    p.add_argument('--headless', action='store_true', help='no mostrar ventana')
+    p.add_argument('--image-size', type=int, nargs=2, default=(200, 200), help='tamaño imagen')
+    p.add_argument('--uart-port', default='/dev/ttyACM0', help='puerto uart')
+    p.add_argument('--uart-baudrate', type=int, default=9600, help='baudrate uart')
+    p.add_argument('--tiempo-registro', type=int, default=30, help='tiempo en segundos para registro')
+    args = p.parse_args()
+
+    try:
+        model_path = prepare_model_path(args.model)
+        model = load_model(model_path)
+        print(f"modelo cargado: {model_path}")
+    except Exception as e:
+        print(f"error cargando modelo: {e}")
+        sys.exit(2)
+
+    CLASS_NAMES = ['borrador', 'mRojo', 'mNegro', 'mAzul', 'nada']
+    IMAGE_SIZE = tuple(args.image_size)
+
+    cap = cv2.VideoCapture(args.device)
+    if not cap.isOpened():
+        print(f"no se pudo abrir camara {args.device}")
+        sys.exit(3)
+
+    print("camara abierta. presiona 'q' para salir")
+
+    display = has_display() and not args.headless
+    if not display:
+        print("modo headless activo")
+
+    puerto_uart = None
+    try:
+        puerto_uart = serial.Serial(args.uart_port, args.uart_baudrate, timeout=1)
+        puerto_uart.reset_input_buffer()
+        print(f"puerto uart abierto: {args.uart_port} @ {args.uart_baudrate} baudios")
+    except Exception as error:
+        print(f"no se pudo abrir puerto uart ({args.uart_port}): {error}")
+        print("continuando sin uart")
+    
+    registro = RegistroDeteccionObjetos(puerto_uart)
+    registro.iniciar_registro(args.tiempo_registro)
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("no se pudo leer frame")
+            break
+
+        img = cv2.resize(frame, IMAGE_SIZE, interpolation=cv2.INTER_AREA)
+        img = np.expand_dims(img, axis=0)
+        img = tf.cast(img, tf.float32) / 255.0
+
+        preds = model.predict(img, verbose=0)
+        idx = int(np.argmax(preds[0]))
+        label = CLASS_NAMES[idx] if idx < len(CLASS_NAMES) else f"clase {idx}"
+        conf = float(np.max(preds[0])) * 100.0
+
+        if conf > 60.0 and label != 'nada':
+            registro_continua = registro.registrar_deteccion(label)
+            if not registro_continua:
+                break
+
+        text = f'{label} ({conf:.2f}%)'
+        cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        
+        if registro.registro_activo:
+            tiempo_transcurrido = time.time() - registro.tiempo_inicio
+            tiempo_restante = int(registro.tiempo_registro - tiempo_transcurrido)
+            info_registro = f'tiempo restante: {tiempo_restante}s'
+            cv2.putText(frame, info_registro, (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
+        if display:
+            cv2.imshow('Live Prediction', frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+        else:
+            print(text)
+            time.sleep(0.1)
+
+    cap.release()
+    if display:
+        cv2.destroyAllWindows()
+    
+    if puerto_uart and puerto_uart.is_open:
+        puerto_uart.close()
+        print("\npuerto uart cerrado")
+
+
+if __name__ == '__main__':
+    main()
+
+
