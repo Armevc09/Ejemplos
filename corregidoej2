@@ -1,0 +1,47 @@
+from machine import Pin
+import sys
+import select
+import utime
+
+# LEDs para los marcadores
+led_rojo = Pin(15, Pin.OUT)    # mRojo
+led_azul = Pin(16, Pin.OUT)    # mAzul
+led_negro = Pin(13, Pin.OUT)   # mNegro
+
+# Apagar todos los LEDs al inicio
+led_rojo.value(0)
+led_azul.value(0)
+led_negro.value(0)
+
+# UART
+poll = select.poll()
+poll.register(sys.stdin, select.POLLIN)
+
+print("Esperando mensajes por UART...")
+
+# Bucle principal: leer mensajes por UART y controlar LEDs
+while True:
+    if poll.poll(0):
+        linea = sys.stdin.readline().strip()
+        
+        print(f"Recibido: {linea}")
+        
+        # Apagar todos los LEDs primero
+        led_rojo.value(0)
+        led_azul.value(0)
+        led_negro.value(0)
+        
+        # Encender el LED correspondiente según el mensaje
+        if linea == "mRojo":
+            led_rojo.value(1)
+            print("LED Rojo encendido (pin 15)")
+        elif linea == "mAzul":
+            led_azul.value(1)
+            print("LED Azul encendido (pin 16)")
+        elif linea == "mNegro":
+            led_negro.value(1)
+            print("LED Negro encendido (pin 13)")
+        elif linea == "Borrador":
+            # Si llega "Borrador", puedes decidir qué hacer
+            # Por ahora todos los LEDs quedan apagados
+            print("Borrador detectado - LEDs apagados")
