@@ -1,0 +1,51 @@
+from machine import Pin, Timer
+import sys
+import select
+import utime
+
+# LEDs
+led_azul = Pin(15, Pin.OUT)
+led_rojo = Pin(14, Pin.OUT)
+Buzzer = Pin(16, Pin.OUT)
+
+time1 = False
+time2 = True
+contador = 0
+
+# UART
+poll = select.poll()
+poll.register(sys.stdin, select.POLLIN)
+
+# Timer
+timer = Timer()
+
+def fun_principal(t):
+    global time1, contador, time2
+
+    if time1:
+        if time2 == True:
+            Buzzer.value(1)
+            contador += 1
+            if contador >= 2:
+                Buzzer.value(0)
+                contador = 0
+                time2 = False
+        if time2 == False:
+            contador += 1
+            if contador >= 25:
+                contador = 0
+                time2 = True
+
+# Inicializar timer
+timer.init(freq=5, mode=Timer.PERIODIC, callback=fun_principal)
+
+# Bucle principal: aquí se lee lo que llega por UART
+while True:
+    if poll.poll(0):
+        linea = sys.stdin.readline().strip()
+        partes = linea.split()
+
+        if partes[0] == "nada":
+            time1 = True
+        else:
+            time1 = False
